@@ -1,90 +1,143 @@
-# Importing the required libraries
-import cv2
 import os
+import cv2
 import numpy as np
 from imgbeddings import imgbeddings
 from PIL import Image
 import psycopg2
+from psycopg2.extras import Json
 from sklearn.preprocessing import normalize
+import logging
 
-# Suppressing oneDNN warnings from TensorFlow
-import os
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Suppress oneDNN warnings from TensorFlow
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-# Loading the Haar Cascade algorithm file
-alg = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\haarcascade_frontalface_default.xml"
-haar_cascade = cv2.CascadeClassifier(alg)
+# Paths and constants
+HAAR_CASCADE_PATH = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\haarcascade_frontalface_default.xml"
+INPUT_IMAGE_PATH = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\bigbang.png"
+STORED_FACES_DIR = "stored-faces"
+os.makedirs(STORED_FACES_DIR, exist_ok=True)
 
-# Loading the image path
-file_name = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\bigbang.png"
-img = cv2.imread(file_name, 0)  # Reading the image
-gray_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Creating a black and white version of the image
+def load_haar_cascade(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Haar Cascade file not found: {path}")
+    return cv2.CascadeClassifier(path)
 
-# Detecting the faces
-faces = haar_cascade.detectMultiScale(
-    gray_img, scaleFactor=1.05, minNeighbors=2, minSize=(100, 100)
-)
+def detect_and_save_faces(image_path, haar_cascade, output_dir):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not load image: {image_path}")
+    
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = haar_cascade.detectMultiScale(gray_img, scaleFactor=1.05, minNeighbors=2, minSize=(100, 100))
 
-i = 0
-# For each detected face, crop the image and save
-for x, y, w, h in faces:
-    cropped_image = img[y : y + h, x : x + w]  # Cropping the face
-    target_file_name = f'stored-faces/{i}.jpg'
-    cv2.imwrite(target_file_name, cropped_image)  # Saving the cropped face
-    i += 1
+    if len(faces) == 0:
+        logging.warning("No faces detected in the image.")
+        return 0
 
-# Connecting to the PostgreSQL database
-conn = psycopg2.connect("postgres://avnadmin:AVNS_FRtYHG63QjXPdo1jxt2@pg-13195976-faces-nalin.i.aivencloud.com:13387/defaultdb?sslmode=require")
+    for i, (x, y, w, h) in enumerate(faces):
+        cropped_image = img[y:y+h, x:x+w]
+        cropped_image = cv2.resize(cropped_image, (128, 128))  # Resize to a consistent size
+        output_path = os.path.join(output_dir, f"{i}.jpg")
+        cv2.imwrite(output_path, cropped_image)
+        logging.info(f"Saved face to: {output_path}")
 
-# Initialize imgbeddings model
-ibed = imgbeddings()
+    return len(faces)
 
-# Process each cropped face image and insert it into the database
-for filename in os.listdir("stored-faces"):
-    img = Image.open("stored-faces/" + filename)  # Opening the image
-    embedding = ibed.to_embeddings(img)  # Calculating the embeddings
-    normalized_embedding = normalize([embedding[0]])[0]  # Normalize the embeddings
+def connect_to_database():
+    try:
+        conn = psycopg2.connect(
+            os.environ.get("DB_CONNECTION_STRING"),
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        return conn
+    except Exception as e:
+        logging.error("Failed to connect to the database.", exc_info=True)
+        raise e
 
-    cur = conn.cursor()
-    # Check if the record with the same filename already exists
-    cur.execute("SELECT * FROM pictures WHERE picture = %s", (filename,))
-    result = cur.fetchone()
+def process_and_store_embeddings(db_conn, imgbeddings_model, directory):
+    cursor = db_conn.cursor()
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        img = Image.open(file_path)
+        embedding = imgbeddings_model.to_embeddings(img)
+        normalized_embedding = normalize([embedding[0]])[0]
 
-    if result is None:
-        # Insert the new image if it doesn't exist
-        cur.execute("INSERT INTO pictures (picture, embedding) VALUES (%s, %s)", (filename, normalized_embedding.tolist()))
-        print(f"Inserted: {filename}")
-    else:
-        print(f"Skipped: {filename} (already exists)")
+        cursor.execute("SELECT * FROM pictures WHERE picture = %s", (filename,))
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "INSERT INTO pictures (picture, embedding) VALUES (%s, %s)",
+                (filename, Json(normalized_embedding.tolist()))
+            )
+            logging.info(f"Inserted: {filename}")
+        else:
+            logging.info(f"Skipped: {filename} (already exists)")
+    db_conn.commit()
 
-conn.commit()
+def find_most_similar_face(db_conn, imgbeddings_model, input_image_path):
+    img = Image.open(input_image_path)
+    embedding = imgbeddings_model.to_embeddings(img)
+    normalized_embedding = normalize([embedding[0]])[0]
 
-# Now, let's find and display the most similar face to a new input image
-file_name = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\cooper.png"  # Path to the input face image
-img = Image.open(file_name)  # Open the image
-embedding = ibed.to_embeddings(img)  # Calculate the embeddings for the input image
-normalized_embedding = normalize([embedding[0]])[0]  # Normalize the input image embedding
+    cursor = db_conn.cursor()
+    embedding_as_json = Json(normalized_embedding.tolist())
+    cursor.execute(
+        "SELECT picture, embedding FROM pictures ORDER BY embedding <-> %s LIMIT 1",
+        (embedding_as_json,)
+    )
+    result = cursor.fetchone()
+    if result:
+        return os.path.join(STORED_FACES_DIR, result["picture"])
+    return None
 
-# Query the database for the most similar face
-cur = conn.cursor()
-string_representation = "[" + ",".join(str(x) for x in normalized_embedding.tolist()) + "]"
-cur.execute("SELECT * FROM pictures ORDER BY embedding <-> %s LIMIT 1;", (string_representation,))
-rows = cur.fetchall()
-
-# Function to display the output image
 def display_image(image_path):
-    img_to_display = cv2.imread(image_path)
-    cv2.imshow('Most Similar Face', img_to_display)
-    cv2.waitKey(0)  # Wait until a key is pressed
-    cv2.destroyAllWindows()
+    img = cv2.imread(image_path)
+    if img is not None:
+        cv2.imshow("Most Similar Face", img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        logging.warning(f"Image not found: {image_path}")
 
-# Show the most similar face
-if rows:
-    for row in rows:
-        image_path = "stored-faces/" + row[0]
-        print(f"Displaying: {row[0]}")
-        display_image(image_path)
+def main():
+    try:
+        # Load Haar Cascade
+        haar_cascade = load_haar_cascade(HAAR_CASCADE_PATH)
 
-# Closing the cursor and the connection
-cur.close()
-conn.close()
+        # Detect and save faces
+        face_count = detect_and_save_faces(INPUT_IMAGE_PATH, haar_cascade, STORED_FACES_DIR)
+        if face_count == 0:
+            logging.warning("No faces detected. Exiting.")
+            return
+
+        # Connect to the database
+        db_conn = connect_to_database()
+
+        # Initialize imgbeddings
+        imgbeddings_model = imgbeddings()
+
+        # Process and store embeddings
+        process_and_store_embeddings(db_conn, imgbeddings_model, STORED_FACES_DIR)
+
+        # Find the most similar face
+        most_similar_image_path = find_most_similar_face(
+            db_conn, imgbeddings_model, "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\cooper.png"
+        )
+
+        if most_similar_image_path:
+            logging.info(f"Displaying most similar face: {most_similar_image_path}")
+            display_image(most_similar_image_path)
+        else:
+            logging.warning("No similar face found in the database.")
+
+    except Exception as e:
+        logging.error("An error occurred during execution.", exc_info=True)
+    finally:
+        if 'db_conn' in locals() and db_conn:
+            db_conn.close()
+            logging.info("Database connection closed.")
+
+if __name__ == "__main__":
+    main()
