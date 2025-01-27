@@ -7,6 +7,7 @@ import psycopg2
 from psycopg2.extras import Json
 from sklearn.preprocessing import normalize
 import logging
+import streamlit as st
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,36 +17,39 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Paths and constants
 HAAR_CASCADE_PATH = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\haarcascade_frontalface_default.xml"
-INPUT_IMAGE_PATH = "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\bigbang.png"
 STORED_FACES_DIR = "stored-faces"
 os.makedirs(STORED_FACES_DIR, exist_ok=True)
 
+# Streamlit setup
+st.title("Face Recognition with Similarity Search")
+st.write("Upload two images: one to detect faces and another to compare similarity.")
+
+# Load Haar Cascade
 def load_haar_cascade(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Haar Cascade file not found: {path}")
     return cv2.CascadeClassifier(path)
 
-def detect_and_save_faces(image_path, haar_cascade, output_dir):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Could not load image: {image_path}")
-    
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+# Detect and save faces
+def detect_and_save_faces(image, haar_cascade, output_dir):
+    gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     faces = haar_cascade.detectMultiScale(gray_img, scaleFactor=1.05, minNeighbors=2, minSize=(100, 100))
 
     if len(faces) == 0:
-        logging.warning("No faces detected in the image.")
-        return 0
+        st.warning("No faces detected in the image.")
+        return 0, None
 
+    face_images = []
     for i, (x, y, w, h) in enumerate(faces):
-        cropped_image = img[y:y+h, x:x+w]
+        cropped_image = image[y:y+h, x:x+w]
         cropped_image = cv2.resize(cropped_image, (128, 128))  # Resize to a consistent size
         output_path = os.path.join(output_dir, f"{i}.jpg")
         cv2.imwrite(output_path, cropped_image)
-        logging.info(f"Saved face to: {output_path}")
+        face_images.append(output_path)
 
-    return len(faces)
+    return len(faces), face_images
 
+# Connect to database
 def connect_to_database():
     try:
         conn = psycopg2.connect(
@@ -54,9 +58,10 @@ def connect_to_database():
         )
         return conn
     except Exception as e:
-        logging.error("Failed to connect to the database.", exc_info=True)
+        st.error("Failed to connect to the database.")
         raise e
 
+# Process and store embeddings
 def process_and_store_embeddings(db_conn, imgbeddings_model, directory):
     cursor = db_conn.cursor()
     for filename in os.listdir(directory):
@@ -76,6 +81,7 @@ def process_and_store_embeddings(db_conn, imgbeddings_model, directory):
             logging.info(f"Skipped: {filename} (already exists)")
     db_conn.commit()
 
+# Find most similar face
 def find_most_similar_face(db_conn, imgbeddings_model, input_image_path):
     img = Image.open(input_image_path)
     embedding = imgbeddings_model.to_embeddings(img)
@@ -92,48 +98,61 @@ def find_most_similar_face(db_conn, imgbeddings_model, input_image_path):
         return os.path.join(STORED_FACES_DIR, result["picture"])
     return None
 
-def display_image(image_path):
-    img = cv2.imread(image_path)
-    if img is not None:
-        cv2.imshow("Most Similar Face", img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    else:
-        logging.warning(f"Image not found: {image_path}")
-
+# Streamlit UI
 def main():
     try:
         # Load Haar Cascade
         haar_cascade = load_haar_cascade(HAAR_CASCADE_PATH)
 
-        # Detect and save faces
-        face_count = detect_and_save_faces(INPUT_IMAGE_PATH, haar_cascade, STORED_FACES_DIR)
-        if face_count == 0:
-            logging.warning("No faces detected. Exiting.")
-            return
+        # Image upload: Image 1 for face detection
+        st.header("Step 1: Upload an image for face detection")
+        uploaded_image1 = st.file_uploader("Upload Image 1 (for Face Detection)", type=["jpg", "png", "jpeg"])
+        
+        # Image upload: Image 2 for comparison
+        st.header("Step 2: Upload an image for similarity comparison")
+        uploaded_image2 = st.file_uploader("Upload Image 2 (for Comparison)", type=["jpg", "png", "jpeg"])
 
-        # Connect to the database
-        db_conn = connect_to_database()
+        if uploaded_image1 and uploaded_image2:
+            # Read and display Image 1 (Face Detection)
+            img1 = np.array(Image.open(uploaded_image1))
+            st.image(img1, caption="Uploaded Image 1 (for Face Detection)", use_column_width=True)
 
-        # Initialize imgbeddings
-        imgbeddings_model = imgbeddings()
+            # Detect and save faces from Image 1
+            face_count, face_images = detect_and_save_faces(img1, haar_cascade, STORED_FACES_DIR)
+            if face_count > 0:
+                st.write(f"Detected {face_count} face(s) in Image 1.")
 
-        # Process and store embeddings
-        process_and_store_embeddings(db_conn, imgbeddings_model, STORED_FACES_DIR)
+                # Display detected faces
+                for face_image in face_images:
+                    st.image(face_image, caption=f"Detected Face {face_images.index(face_image)+1}", use_column_width=True)
 
-        # Find the most similar face
-        most_similar_image_path = find_most_similar_face(
-            db_conn, imgbeddings_model, "C:\\Users\\LENOVO\\OneDrive\\Desktop\\face_rec\\cooper.png"
-        )
+                # Connect to the database
+                db_conn = connect_to_database()
 
-        if most_similar_image_path:
-            logging.info(f"Displaying most similar face: {most_similar_image_path}")
-            display_image(most_similar_image_path)
-        else:
-            logging.warning("No similar face found in the database.")
+                # Initialize imgbeddings
+                imgbeddings_model = imgbeddings()
 
+                # Process and store embeddings of the detected faces
+                process_and_store_embeddings(db_conn, imgbeddings_model, STORED_FACES_DIR)
+
+                # Find most similar face based on Image 2 (comparison image)
+                img2 = np.array(Image.open(uploaded_image2))
+                st.image(img2, caption="Uploaded Image 2 (for Comparison)", use_column_width=True)
+
+                most_similar_image_path = find_most_similar_face(db_conn, imgbeddings_model, uploaded_image2)
+
+                if most_similar_image_path:
+                    st.write(f"Most similar face found: {most_similar_image_path}")
+                    st.image(most_similar_image_path, caption="Most Similar Face", use_column_width=True)
+                else:
+                    st.warning("No similar face found in the database.")
+            else:
+                st.warning("No faces detected in Image 1.")
+    
     except Exception as e:
+        st.error("An error occurred during execution.")
         logging.error("An error occurred during execution.", exc_info=True)
+
     finally:
         if 'db_conn' in locals() and db_conn:
             db_conn.close()
