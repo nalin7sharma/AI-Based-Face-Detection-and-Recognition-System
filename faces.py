@@ -4,7 +4,7 @@ import numpy as np
 from imgbeddings import imgbeddings
 from PIL import Image, UnidentifiedImageError
 import psycopg2
-from psycopg2.extras import Json, DictCursor
+from psycopg2.extras import DictCursor
 from sklearn.preprocessing import normalize
 import logging
 import streamlit as st
@@ -12,17 +12,22 @@ from typing import List, Tuple, Optional
 from contextlib import contextmanager
 import tempfile
 import hashlib
+import dlib  # For face alignment
+from deepface import DeepFace  # For additional face recognition models
+from datetime import datetime
 
 # -------------------- Configuration --------------------
 class Config:
     HAAR_CASCADE_PATH = os.getenv("HAAR_CASCADE_PATH", "haarcascade_frontalface_default.xml")
     STORED_FACES_DIR = os.getenv("STORED_FACES_DIR", "stored-faces")
     DB_CONN_STRING = os.getenv("DB_CONN_STRING")
-    IMAGE_SIZE = (128, 128)
+    IMAGE_SIZE = (160, 160)  # Updated for better face recognition
     DETECTION_SCALE_FACTOR = 1.05
     DETECTION_MIN_NEIGHBORS = 5
     DETECTION_MIN_SIZE = (100, 100)
     SIMILARITY_THRESHOLD = 0.8
+    FACE_ALIGNMENT = True  # Enable face alignment
+    FACE_RECOGNITION_MODEL = "Facenet"  # Options: "Facenet", "VGG-Face", "OpenFace", "DeepFace"
 
 os.makedirs(Config.STORED_FACES_DIR, exist_ok=True)
 
@@ -69,6 +74,8 @@ class FaceProcessor:
     def __init__(self):
         self.haar_cascade = self._load_haar_cascade()
         self.imgbeddings_model = imgbeddings()
+        self.face_detector = dlib.get_frontal_face_detector() if Config.FACE_ALIGNMENT else None
+        self.face_landmarks = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat") if Config.FACE_ALIGNMENT else None
 
     def _load_haar_cascade(self):
         """Load and verify Haar Cascade classifier"""
@@ -82,25 +89,40 @@ class FaceProcessor:
             raise ValueError("Invalid image file")
         return True
 
+    def _align_face(self, image: np.ndarray, face_rect) -> np.ndarray:
+        """Align face using facial landmarks"""
+        landmarks = self.face_landmarks(image, face_rect)
+        aligned_face = dlib.get_face_chip(image, landmarks)
+        return aligned_face
+
     def detect_faces(self, image: np.ndarray) -> Tuple[int, List[str]]:
         """Detect faces in an image and save cropped faces"""
         self._validate_image(image)
         gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        faces = self.haar_cascade.detectMultiScale(
-            gray_img,
-            scaleFactor=Config.DETECTION_SCALE_FACTOR,
-            minNeighbors=Config.DETECTION_MIN_NEIGHBORS,
-            minSize=Config.DETECTION_MIN_SIZE
-        )
+        if Config.FACE_ALIGNMENT:
+            faces = self.face_detector(gray_img)
+        else:
+            faces = self.haar_cascade.detectMultiScale(
+                gray_img,
+                scaleFactor=Config.DETECTION_SCALE_FACTOR,
+                minNeighbors=Config.DETECTION_MIN_NEIGHBORS,
+                minSize=Config.DETECTION_MIN_SIZE
+            )
 
         if len(faces) == 0:
             return 0, []
 
         face_paths = []
-        for i, (x, y, w, h) in enumerate(faces):
+        for i, face in enumerate(faces):
             try:
-                face_img = image[y:y+h, x:x+w]
+                if Config.FACE_ALIGNMENT:
+                    x, y, w, h = face.left(), face.top(), face.width(), face.height()
+                    face_img = self._align_face(image, face)
+                else:
+                    x, y, w, h = face
+                    face_img = image[y:y+h, x:x+w]
+
                 face_img = cv2.resize(face_img, Config.IMAGE_SIZE)
                 filename = f"face_{hashlib.sha256(face_img.tobytes()).hexdigest()[:16]}.jpg"
                 file_path = os.path.join(Config.STORED_FACES_DIR, filename)
@@ -114,9 +136,13 @@ class FaceProcessor:
     def generate_embedding(self, image_path: str) -> Optional[np.ndarray]:
         """Generate normalized embedding for an image"""
         try:
-            with Image.open(image_path) as img:
-                embedding = self.imgbeddings_model.to_embeddings(img)
-                return normalize([embedding[0]])[0]
+            if Config.FACE_RECOGNITION_MODEL == "imgbeddings":
+                with Image.open(image_path) as img:
+                    embedding = self.imgbeddings_model.to_embeddings(img)
+                    return normalize([embedding[0]])[0]
+            else:
+                embedding = DeepFace.represent(image_path, model_name=Config.FACE_RECOGNITION_MODEL)
+                return normalize([embedding[0]["embedding"]])[0]
         except (IOError, UnidentifiedImageError) as e:
             logger.error(f"Invalid image file {image_path}: {e}")
             return None
@@ -188,6 +214,8 @@ class FaceRecognitionApp:
 
         with st.expander("Advanced Settings"):
             st.write(f"Similarity Threshold: {Config.SIMILARITY_THRESHOLD}")
+            st.write(f"Face Recognition Model: {Config.FACE_RECOGNITION_MODEL}")
+            st.write(f"Face Alignment: {'Enabled' if Config.FACE_ALIGNMENT else 'Disabled'}")
 
         col1, col2 = st.columns(2)
         
