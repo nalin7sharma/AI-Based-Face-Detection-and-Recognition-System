@@ -4,17 +4,20 @@ import numpy as np
 from imgbeddings import imgbeddings
 from PIL import Image, UnidentifiedImageError
 import psycopg2
-from psycopg2.extras import DictCursor
+from psycopg2.extras import DictCursor, Json
 from sklearn.preprocessing import normalize
 import logging
 import streamlit as st
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from contextlib import contextmanager
 import tempfile
 import hashlib
 import dlib  # For face alignment
 from deepface import DeepFace  # For additional face recognition models
 from datetime import datetime
+import json
+from concurrent.futures import ThreadPoolExecutor  # For parallel processing
+import time
 
 # -------------------- Configuration --------------------
 class Config:
@@ -28,12 +31,40 @@ class Config:
     SIMILARITY_THRESHOLD = 0.8
     FACE_ALIGNMENT = True  # Enable face alignment
     FACE_RECOGNITION_MODEL = "Facenet"  # Options: "Facenet", "VGG-Face", "OpenFace", "DeepFace"
+    MAX_WORKERS = 4  # For parallel processing
+    LOG_FILE = "face_recognition.log"
+    ENABLE_METRICS = True  # Enable performance metrics
 
 os.makedirs(Config.STORED_FACES_DIR, exist_ok=True)
 
 # -------------------- Logging --------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(Config.LOG_FILE), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
+
+# -------------------- Metrics --------------------
+class Metrics:
+    def __init__(self):
+        self.start_time = time.time()
+        self.face_detection_time = 0
+        self.embedding_generation_time = 0
+        self.database_query_time = 0
+
+    def log_metrics(self):
+        total_time = time.time() - self.start_time
+        metrics = {
+            "total_time": total_time,
+            "face_detection_time": self.face_detection_time,
+            "embedding_generation_time": self.embedding_generation_time,
+            "database_query_time": self.database_query_time,
+        }
+        logger.info(f"Performance Metrics: {json.dumps(metrics, indent=2)}")
+        if Config.ENABLE_METRICS:
+            st.sidebar.subheader("Performance Metrics")
+            st.sidebar.json(metrics)
 
 # -------------------- Database Handler --------------------
 class DatabaseHandler:
@@ -44,7 +75,7 @@ class DatabaseHandler:
         try:
             conn = psycopg2.connect(
                 Config.DB_CONN_STRING,
-                cursor_factory=DictCursor
+                cursor_factory=DictCursor,
             )
             yield conn
         except psycopg2.Error as e:
@@ -58,15 +89,18 @@ class DatabaseHandler:
     def initialize_database(self):
         """Initialize database tables and indexes"""
         with self.get_connection() as conn, conn.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pictures (
                     id SERIAL PRIMARY KEY,
                     picture TEXT UNIQUE,
                     embedding cube,
+                    metadata JSONB,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS embedding_idx ON pictures USING gist(embedding);
-            """)
+                """
+            )
             conn.commit()
 
 # -------------------- Face Processor --------------------
@@ -75,7 +109,9 @@ class FaceProcessor:
         self.haar_cascade = self._load_haar_cascade()
         self.imgbeddings_model = imgbeddings()
         self.face_detector = dlib.get_frontal_face_detector() if Config.FACE_ALIGNMENT else None
-        self.face_landmarks = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat") if Config.FACE_ALIGNMENT else None
+        self.face_landmarks = (
+            dlib.shape_predictor("shape_predictor_68_face_landmarks.dat") if Config.FACE_ALIGNMENT else None
+        )
 
     def _load_haar_cascade(self):
         """Load and verify Haar Cascade classifier"""
@@ -99,7 +135,7 @@ class FaceProcessor:
         """Detect faces in an image and save cropped faces"""
         self._validate_image(image)
         gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
+
         if Config.FACE_ALIGNMENT:
             faces = self.face_detector(gray_img)
         else:
@@ -107,7 +143,7 @@ class FaceProcessor:
                 gray_img,
                 scaleFactor=Config.DETECTION_SCALE_FACTOR,
                 minNeighbors=Config.DETECTION_MIN_NEIGHBORS,
-                minSize=Config.DETECTION_MIN_SIZE
+                minSize=Config.DETECTION_MIN_SIZE,
             )
 
         if len(faces) == 0:
@@ -121,7 +157,7 @@ class FaceProcessor:
                     face_img = self._align_face(image, face)
                 else:
                     x, y, w, h = face
-                    face_img = image[y:y+h, x:x+w]
+                    face_img = image[y : y + h, x : x + w]
 
                 face_img = cv2.resize(face_img, Config.IMAGE_SIZE)
                 filename = f"face_{hashlib.sha256(face_img.tobytes()).hexdigest()[:16]}.jpg"
@@ -153,6 +189,7 @@ class FaceRecognitionApp:
         self.db_handler = DatabaseHandler()
         self.face_processor = FaceProcessor()
         self.db_handler.initialize_database()
+        self.metrics = Metrics()
 
     def _save_embeddings_to_db(self, face_paths: List[str]):
         """Save face embeddings to database"""
@@ -160,16 +197,18 @@ class FaceRecognitionApp:
             for path in face_paths:
                 filename = os.path.basename(path)
                 embedding = self.face_processor.generate_embedding(path)
-                
+
                 if embedding is None:
                     continue
 
                 try:
                     cursor.execute(
-                        """INSERT INTO pictures (picture, embedding)
-                        VALUES (%s, CUBE(%s))
-                        ON CONFLICT (picture) DO NOTHING""",
-                        (filename, embedding.tolist())
+                        """
+                        INSERT INTO pictures (picture, embedding, metadata)
+                        VALUES (%s, CUBE(%s), %s)
+                        ON CONFLICT (picture) DO NOTHING
+                        """,
+                        (filename, embedding.tolist(), Json({"source": "upload"})),
                     )
                     logger.info(f"Processed: {filename}")
                 except psycopg2.Error as e:
@@ -177,7 +216,7 @@ class FaceRecognitionApp:
 
             conn.commit()
 
-    def _find_similar_face(self, query_image_path: str) -> Optional[str]:
+    def _find_similar_face(self, query_image_path: str) -> Optional[Dict]:
         """Find most similar face in database"""
         query_embedding = self.face_processor.generate_embedding(query_image_path)
         if query_embedding is None:
@@ -186,31 +225,38 @@ class FaceRecognitionApp:
         with self.db_handler.get_connection() as conn, conn.cursor() as cursor:
             try:
                 cursor.execute(
-                    """SELECT picture, 
-                       1 - (embedding <-> CUBE(%s)) as similarity 
-                       FROM pictures 
-                       WHERE 1 - (embedding <-> CUBE(%s)) > %s
-                       ORDER BY similarity DESC 
-                       LIMIT 1""",
-                    (query_embedding.tolist(), 
-                     query_embedding.tolist(), 
-                     Config.SIMILARITY_THRESHOLD)
+                    """
+                    SELECT picture, 
+                    1 - (embedding <-> CUBE(%s)) as similarity 
+                    FROM pictures 
+                    WHERE 1 - (embedding <-> CUBE(%s)) > %s
+                    ORDER BY similarity DESC 
+                    LIMIT 1
+                    """,
+                    (query_embedding.tolist(), query_embedding.tolist(), Config.SIMILARITY_THRESHOLD),
                 )
                 result = cursor.fetchone()
-                return os.path.join(Config.STORED_FACES_DIR, result["picture"]) if result else None
+                if result:
+                    return {
+                        "path": os.path.join(Config.STORED_FACES_DIR, result["picture"]),
+                        "similarity": result["similarity"],
+                    }
+                return None
             except psycopg2.Error as e:
                 logger.error(f"Database query error: {e}")
                 return None
 
     def run(self):
         """Main application flow"""
-        st.title("Face Recognition with Similarity Search")
-        st.markdown("""
+        st.title("Advanced Face Recognition System")
+        st.markdown(
+            """
             **Instructions:**
             1. Upload a reference image for face detection
             2. Upload a query image for similarity search
             3. View detected faces and similarity results
-        """)
+            """
+        )
 
         with st.expander("Advanced Settings"):
             st.write(f"Similarity Threshold: {Config.SIMILARITY_THRESHOLD}")
@@ -218,7 +264,7 @@ class FaceRecognitionApp:
             st.write(f"Face Alignment: {'Enabled' if Config.FACE_ALIGNMENT else 'Disabled'}")
 
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.header("Reference Image")
             ref_file = st.file_uploader("Upload reference image", type=["jpg", "png", "jpeg"])
@@ -233,12 +279,15 @@ class FaceRecognitionApp:
                 with st.spinner("Processing reference image..."):
                     ref_image = np.array(Image.open(ref_file))
                     st.image(ref_image, caption="Reference Image", use_column_width=True)
-                    
+
+                    start_time = time.time()
                     face_count, face_paths = self.face_processor.detect_faces(ref_image)
+                    self.metrics.face_detection_time = time.time() - start_time
+
                     if face_count == 0:
                         st.warning("No faces detected in reference image")
                         return
-                    
+
                     st.success(f"Detected {face_count} face(s)")
                     self._save_embeddings_to_db(face_paths)
 
@@ -253,17 +302,22 @@ class FaceRecognitionApp:
                 with st.spinner("Searching for similar faces..."):
                     query_image = np.array(Image.open(query_file))
                     st.image(query_image, caption="Query Image", use_column_width=True)
-                    
+
                     # Save query image temporarily
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
                         Image.fromarray(query_image).save(tmp_file.name)
-                        similar_path = self._find_similar_face(tmp_file.name)
-                    
-                    if similar_path:
-                        st.success("Similar face found!")
-                        st.image(similar_path, caption="Most Similar Face", use_column_width=True)
+                        start_time = time.time()
+                        similar_face = self._find_similar_face(tmp_file.name)
+                        self.metrics.database_query_time = time.time() - start_time
+
+                    if similar_face:
+                        st.success(f"Similar face found with similarity: {similar_face['similarity']:.2f}")
+                        st.image(similar_face["path"], caption="Most Similar Face", use_column_width=True)
                     else:
                         st.warning("No similar faces found above threshold")
+
+                # Log performance metrics
+                self.metrics.log_metrics()
 
             except Exception as e:
                 logger.error(f"Application error: {e}", exc_info=True)
@@ -274,7 +328,7 @@ if __name__ == "__main__":
     # Suppress TensorFlow logging
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-    
+
     # Initialize and run application
     try:
         app = FaceRecognitionApp()
