@@ -63,6 +63,13 @@ streamlit run app.py
 - Ensure that you have the PostgreSQL database running and the connection string set up in the `DB_CONNECTION_STRING` environment variable.
 - If you don't have a database set up, make sure to modify the code to either use an in-memory database or set up a local PostgreSQL instance.
 
-## License
+## Usage Example
+```bash
+# Add faces to database
+python main.py add --name "John Doe" john.jpg
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+# Search for similar faces
+python main.py search query.jpg
+
+# List all entries
+python main.py list
