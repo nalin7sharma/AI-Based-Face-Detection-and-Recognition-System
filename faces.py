@@ -1,211 +1,196 @@
-# (Previous imports remain the same)
-import tensorflow as tf
-from keras.models import load_model
-from mtcnn import MTCNN  # Advanced face detection
-from sklearn.cluster import DBSCAN  # For face clustering
-import matplotlib.pyplot as plt
-import seaborn as sns
-from io import BytesIO
-import requests
-from functools import lru_cache
+"""
+Advanced Face Recognition System with Database Integration
+Features: Face detection, embedding generation, similarity search, anti-spoofing, and CLI interface
+"""
 
-# -------------------- Enhanced Configuration --------------------
+import os
+import sqlite3
+import argparse
+import logging
+from typing import List, Tuple, Optional, Dict
+from datetime import datetime
+import cv2
+import face_recognition
+import numpy as np
+from sklearn.preprocessing import normalize
+from PIL import Image, UnidentifiedImageError
+
+# Configuration
 class Config:
-    # (Previous configs remain the same)
-    ENABLE_REALTIME = True
-    CLOUD_STORAGE_URL = os.getenv("CLOUD_STORAGE_URL")
-    FACE_DETECTION_MODEL = "mtcnn"  # Options: "haar", "dlib", "mtcnn"
+    DATABASE_PATH = "face_db.sqlite"
+    IMAGE_SIZE = (250, 250)  # Balance between speed and accuracy
+    DETECTION_METHOD = "cnn"  # "hog" for CPU, "cnn" for GPU acceleration
+    SIMILARITY_THRESHOLD = 0.6
+    ENCODING_VERSION = "v2"  # face_recognition encoding model version
     ANTI_SPOOFING = True
-    ENABLE_CLUSTERING = True
-    API_ENDPOINT = "http://localhost:8000/api"  # For microservices
-    DATA_RETENTION_DAYS = 30
+    LANDMARKS_MODEL = "large"  # "small" for faster detection
 
-# -------------------- New: Cloud Integration --------------------
-class CloudStorage:
-    @staticmethod
-    def upload_file(file_path: str) -> str:
-        try:
-            with open(file_path, "rb") as f:
-                response = requests.post(
-                    Config.CLOUD_STORAGE_URL,
-                    files={"file": f},
-                    timeout=10
+# Database Setup
+class FaceDatabase:
+    def __init__(self):
+        self.conn = sqlite3.connect(Config.DATABASE_PATH)
+        self._init_db()
+
+    def _init_db(self):
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS faces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    metadata TEXT
                 )
-            return response.json()["url"]
-        except Exception as e:
-            logger.error(f"Cloud upload failed: {e}")
-            return file_path
+            """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_timestamp ON faces(timestamp)
+            """)
 
-# -------------------- New: Anti-Spoofing --------------------
-class AntiSpoofing:
-    def __init__(self):
-        self.model = load_model("anti_spoofing_model.h5")
-    
-    def detect_liveness(self, image: np.ndarray) -> float:
-        processed = cv2.resize(image, (128, 128))
-        processed = np.expand_dims(processed, axis=0)
-        prediction = self.model.predict(processed)
-        return float(prediction[0][0])
-
-# -------------------- New: Advanced Face Detector --------------------
-class FaceDetectorFactory:
-    @staticmethod
-    def get_detector():
-        if Config.FACE_DETECTION_MODEL == "mtcnn":
-            return MTCNN()
-        elif Config.FACE_DETECTION_MODEL == "dlib":
-            return dlib.get_frontal_face_detector()
-        else:
-            return cv2.CascadeClassifier(Config.HAAR_CASCADE_PATH)
-
-# -------------------- Upgraded Face Processor --------------------
-class FaceProcessor:
-    def __init__(self):
-        # (Previous initialization remains)
-        self.anti_spoof = AntiSpoofing() if Config.ANTI_SPOOFING else None
-        self.detector = FaceDetectorFactory.get_detector()
-        self.face_recognizer = DeepFace.build_model(Config.FACE_RECOGNITION_MODEL)
-        
-    def _detect_faces_mtcnn(self, image: np.ndarray):
-        results = self.detector.detect_faces(image)
-        return [result["box"] for result in results]
-
-    def detect_faces(self, image: np.ndarray) -> Tuple[int, List[str]]:
-        # (Previous code updated with new detection methods)
-        if Config.FACE_DETECTION_MODEL == "mtcnn":
-            faces = self._detect_faces_mtcnn(image)
-        # ... (other detection methods)
-
-        # Add anti-spoofing check
-        if Config.ANTI_SPOOFING:
-            faces = [face for face in faces if self.anti_spoof.detect_liveness(face) > 0.7]
-
-        # Add clustering
-        if Config.ENABLE_CLUSTERING:
-            return self._cluster_faces(faces)
-
-    def _cluster_faces(self, faces: List[np.ndarray]) -> List[List[str]]:
-        embeddings = [self.generate_embedding(face) for face in faces]
-        clustering = DBSCAN(metric="cosine").fit(embeddings)
-        return self._group_clusters(faces, clustering.labels_)
-
-# -------------------- New: Realtime Processing --------------------
-class RealtimeProcessor:
-    def __init__(self):
-        self.video_source = 0  # Webcam
-        self.running = False
-    
-    def start_stream(self):
-        self.running = True
-        st_frame = st.empty()
-        cap = cv2.VideoCapture(self.video_source)
-        
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Process frame
-            processed = self.process_frame(frame)
-            st_frame.image(processed, channels="BGR")
-            
-        cap.release()
-
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        faces = FaceProcessor().detect_faces(frame)
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
-        return frame
-
-# -------------------- New: Analytics Dashboard --------------------
-class AnalyticsDashboard:
-    def show_metrics(self):
-        st.sidebar.subheader("System Metrics")
-        with self.db_handler.get_connection() as conn:
-            df = pd.read_sql("SELECT * FROM pictures", conn)
-        
-        # Cluster visualization
-        fig, ax = plt.subplots()
-        sns.scatterplot(x=df["embedding_x"], y=df["embedding_y"], ax=ax)
-        st.pyplot(fig)
-        
-        # Temporal analysis
-        st.line_chart(df.set_index("created_at")["similarity"])
-
-# -------------------- Upgraded Streamlit App --------------------
-class FaceRecognitionApp:
-    def __init__(self):
-        # (Previous initialization)
-        self.analytics = AnalyticsDashboard()
-        self.realtime = RealtimeProcessor()
-
-    def run(self):
-        # (Previous UI elements)
-        
-        # New: System Dashboard
-        with st.sidebar:
-            self.analytics.show_metrics()
-            
-            if st.button("Database Maintenance"):
-                self._run_maintenance()
-                
-            if Config.ENABLE_REALTIME:
-                if st.button("Start Realtime Processing"):
-                    self.realtime.start_stream()
-
-        # New: Batch Processing Tab
-        with st.expander("Batch Processing"):
-            batch_files = st.file_uploader("Upload multiple images", 
-                                         type=["jpg", "png", "jpeg"],
-                                         accept_multiple_files=True)
-            if batch_files:
-                self._process_batch(batch_files)
-
-        # New: Model Management
-        with st.expander("Model Configuration"):
-            self._model_management_ui()
-
-    def _process_batch(self, files: List[UploadedFile]):
-        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-            futures = [executor.submit(self._process_single, file) for file in files]
-            progress = st.progress(0)
-            for i, future in enumerate(futures):
-                future.result()
-                progress.progress((i+1)/len(futures))
-
-    def _model_management_ui(self):
-        model_choice = st.selectbox("Select Model", ["Facenet", "VGG-Face", "ArcFace"])
-        if model_choice != Config.FACE_RECOGNITION_MODEL:
-            if st.button("Switch Model"):
-                self._update_model(model_choice)
-                
-        if st.button("Optimize Embeddings"):
-            self._optimize_embeddings()
-
-    def _update_model(self, new_model: str):
-        with st.spinner("Migrating embeddings..."):
-            self._migrate_embeddings(new_model)
-            Config.FACE_RECOGNITION_MODEL = new_model
-
-    def _migrate_embeddings(self, new_model: str):
-        # Implementation for embedding migration
-        pass
-
-# -------------------- New: Security Features --------------------
-class SecurityManager:
-    def __init__(self):
-        self.encryption_key = os.getenv("ENCRYPTION_KEY")
-        
-    def encrypt_image(self, image: np.ndarray) -> bytes:
-        _, img_encoded = cv2.imencode('.jpg', image)
-        return self._encrypt_data(img_encoded.tobytes())
-    
-    def audit_log(self, action: str):
-        with self.db_handler.get_connection() as conn:
-            conn.execute(
-                "INSERT INTO audit_log (action, timestamp) VALUES (%s, NOW())",
-                (action,)
+    def add_face(self, name: str, embedding: np.ndarray, metadata: Dict = None):
+        embedding_blob = embedding.tobytes()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO faces (name, embedding, metadata) VALUES (?, ?, ?)",
+                (name, embedding_blob, str(metadata) if metadata else None)
             )
 
-# -------------------- Main Execution --------------------
-# (Remains similar with added security features)
+    def find_similar(self, embedding: np.ndarray, threshold: float) -> List[Dict]:
+        cursor = self.conn.execute("SELECT id, name, embedding FROM faces")
+        target_embedding = normalize([embedding])
+        results = []
+        
+        for row in cursor:
+            db_embedding = np.frombuffer(row[2], dtype=np.float64)
+            db_embedding = normalize([db_embedding])
+            similarity = np.dot(target_embedding, db_embedding.T)[0][0]
+            
+            if similarity >= threshold:
+                results.append({
+                    "id": row[0],
+                    "name": row[1],
+                    "similarity": float(similarity)
+                })
+        
+        return sorted(results, key=lambda x: x["similarity"], reverse=True)
+
+    def close(self):
+        self.conn.close()
+
+# Core Recognition Engine
+class FaceRecognizer:
+    @staticmethod
+    def detect_faces(image_path: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+        try:
+            image = face_recognition.load_image_file(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(
+                image, model=Config.DETECTION_METHOD
+            )
+            
+            if Config.ANTI_SPOOFING:
+                face_locations = [loc for loc in face_locations 
+                                if FaceRecognizer._check_liveness(image, loc)]
+            
+            face_encodings = face_recognition.face_encodings(
+                image, face_locations, num_jitters=2, model=Config.ENCODING_VERSION
+            )
+            
+            processed_faces = []
+            for face in face_encodings:
+                normalized = normalize([face])[0]
+                processed_faces.append(normalized)
+            
+            return processed_faces, face_locations
+        
+        except (FileNotFoundError, UnidentifiedImageError) as e:
+            logging.error(f"Image processing failed: {str(e)}")
+            return [], []
+
+    @staticmethod
+    def _check_liveness(image: np.ndarray, location: Tuple[int, int, int, int]) -> bool:
+        """Basic anti-spoofing using facial landmarks analysis"""
+        try:
+            landmarks = face_recognition.face_landmarks(
+                image, [location], model=Config.LANDMARKS_MODEL
+            )[0]
+            
+            # Simple eye aspect ratio check
+            left_eye = landmarks["left_eye"]
+            right_eye = landmarks["right_eye"]
+            ear = FaceRecognizer._eye_aspect_ratio(left_eye + right_eye)
+            return ear > 0.25  # Threshold for open eyes
+        
+        except Exception as e:
+            logging.warning(f"Liveness check failed: {str(e)}")
+            return False
+
+    @staticmethod
+    def _eye_aspect_ratio(eye_points: List[Tuple[int, int]]) -> float:
+        # Calculate eye aspect ratio (EAR)
+        vertical1 = np.linalg.norm(np.array(eye_points[1]) - np.array(eye_points[5]))
+        vertical2 = np.linalg.norm(np.array(eye_points[2]) - np.array(eye_points[4]))
+        horizontal = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[3]))
+        return (vertical1 + vertical2) / (2.0 * horizontal)
+
+# CLI Interface
+def main():
+    parser = argparse.ArgumentParser(description="Advanced Face Recognition System")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Add face command
+    add_parser = subparsers.add_parser("add", help="Add faces to database")
+    add_parser.add_argument("image", help="Path to image file")
+    add_parser.add_argument("--name", required=True, help="Name for the face")
+
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search for similar faces")
+    search_parser.add_argument("image", help="Path to query image")
+
+    # List command
+    subparsers.add_parser("list", help="List all faces in database")
+
+    args = parser.parse_args()
+    db = FaceDatabase()
+
+    try:
+        if args.command == "add":
+            encodings, locations = FaceRecognizer.detect_faces(args.image)
+            if not encodings:
+                print("No valid faces found in image")
+                return
+
+            for idx, encoding in enumerate(encodings):
+                db.add_face(args.name, encoding, {
+                    "original_image": args.image,
+                    "face_location": locations[idx]
+                })
+            print(f"Added {len(encodings)} faces to database")
+
+        elif args.command == "search":
+            encodings, _ = FaceRecognizer.detect_faces(args.image)
+            if not encodings:
+                print("No faces found in query image")
+                return
+
+            results = db.find_similar(encodings[0], Config.SIMILARITY_THRESHOLD)
+            if results:
+                print("Matching faces:")
+                for match in results:
+                    print(f"- {match['name']} (similarity: {match['similarity']:.2%})")
+            else:
+                print("No matches found")
+
+        elif args.command == "list":
+            cursor = db.conn.execute("SELECT id, name, timestamp FROM faces")
+            for row in cursor:
+                print(f"ID: {row[0]} | Name: {row[1]} | Added: {row[2]}")
+
+        else:
+            parser.print_help()
+
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    main()
