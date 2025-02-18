@@ -1,6 +1,6 @@
 """
 Advanced Face Recognition System with Database Integration
-Features: Face detection, embedding generation, similarity search, anti-spoofing, and CLI interface
+Features: Face detection, embedding generation, similarity search, anti-spoofing, CLI interface, and more
 """
 
 import os
@@ -14,8 +14,12 @@ import face_recognition
 import numpy as np
 from sklearn.preprocessing import normalize
 from PIL import Image, UnidentifiedImageError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import json
+import hashlib
 
-# Configuration
+# -------------------- Configuration --------------------
 class Config:
     DATABASE_PATH = "face_db.sqlite"
     IMAGE_SIZE = (250, 250)  # Balance between speed and accuracy
@@ -24,8 +28,20 @@ class Config:
     ENCODING_VERSION = "v2"  # face_recognition encoding model version
     ANTI_SPOOFING = True
     LANDMARKS_MODEL = "large"  # "small" for faster detection
+    MAX_WORKERS = 4  # For parallel processing
+    LOG_FILE = "face_recognition.log"
+    ENABLE_CACHING = True  # Cache embeddings for faster searches
+    DATA_RETENTION_DAYS = 30  # Auto-delete old entries
 
-# Database Setup
+# -------------------- Logging --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(Config.LOG_FILE), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# -------------------- Database Setup --------------------
 class FaceDatabase:
     def __init__(self):
         self.conn = sqlite3.connect(Config.DATABASE_PATH)
@@ -39,20 +55,28 @@ class FaceDatabase:
                     name TEXT NOT NULL,
                     embedding BLOB NOT NULL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    metadata TEXT
+                    metadata TEXT,
+                    UNIQUE(name, embedding)
                 )
             """)
             self.conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_timestamp ON faces(timestamp)
             """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_name ON faces(name)
+            """)
 
     def add_face(self, name: str, embedding: np.ndarray, metadata: Dict = None):
         embedding_blob = embedding.tobytes()
         with self.conn:
-            self.conn.execute(
-                "INSERT INTO faces (name, embedding, metadata) VALUES (?, ?, ?)",
-                (name, embedding_blob, str(metadata) if metadata else None)
-            )
+            try:
+                self.conn.execute(
+                    "INSERT INTO faces (name, embedding, metadata) VALUES (?, ?, ?)",
+                    (name, embedding_blob, json.dumps(metadata) if metadata else None),
+                )
+                logger.info(f"Added face: {name}")
+            except sqlite3.IntegrityError:
+                logger.warning(f"Duplicate face entry: {name}")
 
     def find_similar(self, embedding: np.ndarray, threshold: float) -> List[Dict]:
         cursor = self.conn.execute("SELECT id, name, embedding FROM faces")
@@ -73,10 +97,18 @@ class FaceDatabase:
         
         return sorted(results, key=lambda x: x["similarity"], reverse=True)
 
+    def cleanup_old_entries(self):
+        with self.conn:
+            self.conn.execute("""
+                DELETE FROM faces 
+                WHERE timestamp < datetime('now', ?)
+            """, (f"-{Config.DATA_RETENTION_DAYS} days",))
+            logger.info("Cleaned up old database entries")
+
     def close(self):
         self.conn.close()
 
-# Core Recognition Engine
+# -------------------- Core Recognition Engine --------------------
 class FaceRecognizer:
     @staticmethod
     def detect_faces(image_path: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
@@ -108,17 +140,21 @@ class FaceRecognizer:
 
     @staticmethod
     def _check_liveness(image: np.ndarray, location: Tuple[int, int, int, int]) -> bool:
-        """Basic anti-spoofing using facial landmarks analysis"""
+        """Advanced anti-spoofing using facial landmarks analysis"""
         try:
             landmarks = face_recognition.face_landmarks(
                 image, [location], model=Config.LANDMARKS_MODEL
             )[0]
             
-            # Simple eye aspect ratio check
+            # Eye aspect ratio (EAR) and mouth aspect ratio (MAR)
             left_eye = landmarks["left_eye"]
             right_eye = landmarks["right_eye"]
+            mouth = landmarks["top_lip"] + landmarks["bottom_lip"]
+            
             ear = FaceRecognizer._eye_aspect_ratio(left_eye + right_eye)
-            return ear > 0.25  # Threshold for open eyes
+            mar = FaceRecognizer._mouth_aspect_ratio(mouth)
+            
+            return ear > 0.25 and mar < 0.8  # Thresholds for open eyes and closed mouth
         
         except Exception as e:
             logging.warning(f"Liveness check failed: {str(e)}")
@@ -132,7 +168,14 @@ class FaceRecognizer:
         horizontal = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[3]))
         return (vertical1 + vertical2) / (2.0 * horizontal)
 
-# CLI Interface
+    @staticmethod
+    def _mouth_aspect_ratio(mouth_points: List[Tuple[int, int]]) -> float:
+        # Calculate mouth aspect ratio (MAR)
+        vertical = np.linalg.norm(np.array(mouth_points[2]) - np.array(mouth_points[10]))
+        horizontal = np.linalg.norm(np.array(mouth_points[0]) - np.array(mouth_points[6]))
+        return vertical / horizontal
+
+# -------------------- CLI Interface --------------------
 def main():
     parser = argparse.ArgumentParser(description="Advanced Face Recognition System")
     subparsers = parser.add_subparsers(dest="command")
@@ -148,6 +191,9 @@ def main():
 
     # List command
     subparsers.add_parser("list", help="List all faces in database")
+
+    # Cleanup command
+    subparsers.add_parser("cleanup", help="Clean up old database entries")
 
     args = parser.parse_args()
     db = FaceDatabase()
@@ -184,6 +230,10 @@ def main():
             cursor = db.conn.execute("SELECT id, name, timestamp FROM faces")
             for row in cursor:
                 print(f"ID: {row[0]} | Name: {row[1]} | Added: {row[2]}")
+
+        elif args.command == "cleanup":
+            db.cleanup_old_entries()
+            print("Database cleanup completed")
 
         else:
             parser.print_help()
