@@ -1,5 +1,5 @@
 """
-Advanced Face Recognition System with Database Integration
+Enterprise-Grade Face Recognition System
 Features: Face detection, embedding generation, similarity search, anti-spoofing, CLI interface, and more
 """
 
@@ -18,20 +18,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import json
 import hashlib
+import tensorflow as tf
+from mtcnn import MTCNN  # Advanced face detection
+from deepface import DeepFace  # For additional face recognition models
+from sklearn.cluster import DBSCAN  # For face clustering
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+import requests
+from cryptography.fernet import Fernet  # For encryption
 
 # -------------------- Configuration --------------------
 class Config:
     DATABASE_PATH = "face_db.sqlite"
     IMAGE_SIZE = (250, 250)  # Balance between speed and accuracy
-    DETECTION_METHOD = "cnn"  # "hog" for CPU, "cnn" for GPU acceleration
+    DETECTION_METHOD = "mtcnn"  # Options: "haar", "dlib", "mtcnn"
     SIMILARITY_THRESHOLD = 0.6
-    ENCODING_VERSION = "v2"  # face_recognition encoding model version
+    ENCODING_VERSION = "Facenet"  # Options: "Facenet", "VGG-Face", "ArcFace"
     ANTI_SPOOFING = True
     LANDMARKS_MODEL = "large"  # "small" for faster detection
     MAX_WORKERS = 4  # For parallel processing
     LOG_FILE = "face_recognition.log"
     ENABLE_CACHING = True  # Cache embeddings for faster searches
     DATA_RETENTION_DAYS = 30  # Auto-delete old entries
+    ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    CLOUD_STORAGE_URL = os.getenv("CLOUD_STORAGE_URL")
+    ENABLE_CLUSTERING = True  # Enable face clustering
+    ENABLE_REALTIME = True  # Enable real-time processing
+    GPU_ACCELERATION = True  # Enable GPU acceleration
 
 # -------------------- Logging --------------------
 logging.basicConfig(
@@ -41,10 +55,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# -------------------- Security --------------------
+class SecurityManager:
+    def __init__(self):
+        self.cipher = Fernet(Config.ENCRYPTION_KEY.encode())
+
+    def encrypt_data(self, data: bytes) -> bytes:
+        return self.cipher.encrypt(data)
+
+    def decrypt_data(self, encrypted_data: bytes) -> bytes:
+        return self.cipher.decrypt(encrypted_data)
+
 # -------------------- Database Setup --------------------
 class FaceDatabase:
     def __init__(self):
         self.conn = sqlite3.connect(Config.DATABASE_PATH)
+        self.security = SecurityManager()
         self._init_db()
 
     def _init_db(self):
@@ -67,12 +93,12 @@ class FaceDatabase:
             """)
 
     def add_face(self, name: str, embedding: np.ndarray, metadata: Dict = None):
-        embedding_blob = embedding.tobytes()
+        encrypted_embedding = self.security.encrypt_data(embedding.tobytes())
         with self.conn:
             try:
                 self.conn.execute(
                     "INSERT INTO faces (name, embedding, metadata) VALUES (?, ?, ?)",
-                    (name, embedding_blob, json.dumps(metadata) if metadata else None),
+                    (name, encrypted_embedding, json.dumps(metadata) if metadata else None),
                 )
                 logger.info(f"Added face: {name}")
             except sqlite3.IntegrityError:
@@ -84,7 +110,8 @@ class FaceDatabase:
         results = []
         
         for row in cursor:
-            db_embedding = np.frombuffer(row[2], dtype=np.float64)
+            decrypted_embedding = self.security.decrypt_data(row[2])
+            db_embedding = np.frombuffer(decrypted_embedding, dtype=np.float64)
             db_embedding = normalize([db_embedding])
             similarity = np.dot(target_embedding, db_embedding.T)[0][0]
             
@@ -110,21 +137,25 @@ class FaceDatabase:
 
 # -------------------- Core Recognition Engine --------------------
 class FaceRecognizer:
-    @staticmethod
-    def detect_faces(image_path: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+    def __init__(self):
+        self.detector = MTCNN() if Config.DETECTION_METHOD == "mtcnn" else None
+        self.security = SecurityManager()
+
+    def detect_faces(self, image_path: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
         try:
             image = face_recognition.load_image_file(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(
-                image, model=Config.DETECTION_METHOD
-            )
+            
+            if Config.DETECTION_METHOD == "mtcnn":
+                faces = self._detect_faces_mtcnn(image)
+            else:
+                faces = face_recognition.face_locations(image, model=Config.DETECTION_METHOD)
             
             if Config.ANTI_SPOOFING:
-                face_locations = [loc for loc in face_locations 
-                                if FaceRecognizer._check_liveness(image, loc)]
+                faces = [loc for loc in faces if self._check_liveness(image, loc)]
             
             face_encodings = face_recognition.face_encodings(
-                image, face_locations, num_jitters=2, model=Config.ENCODING_VERSION
+                image, faces, num_jitters=2, model=Config.ENCODING_VERSION
             )
             
             processed_faces = []
@@ -132,14 +163,17 @@ class FaceRecognizer:
                 normalized = normalize([face])[0]
                 processed_faces.append(normalized)
             
-            return processed_faces, face_locations
+            return processed_faces, faces
         
         except (FileNotFoundError, UnidentifiedImageError) as e:
             logging.error(f"Image processing failed: {str(e)}")
             return [], []
 
-    @staticmethod
-    def _check_liveness(image: np.ndarray, location: Tuple[int, int, int, int]) -> bool:
+    def _detect_faces_mtcnn(self, image: np.ndarray):
+        results = self.detector.detect_faces(image)
+        return [result["box"] for result in results]
+
+    def _check_liveness(self, image: np.ndarray, location: Tuple[int, int, int, int]) -> bool:
         """Advanced anti-spoofing using facial landmarks analysis"""
         try:
             landmarks = face_recognition.face_landmarks(
@@ -151,8 +185,8 @@ class FaceRecognizer:
             right_eye = landmarks["right_eye"]
             mouth = landmarks["top_lip"] + landmarks["bottom_lip"]
             
-            ear = FaceRecognizer._eye_aspect_ratio(left_eye + right_eye)
-            mar = FaceRecognizer._mouth_aspect_ratio(mouth)
+            ear = self._eye_aspect_ratio(left_eye + right_eye)
+            mar = self._mouth_aspect_ratio(mouth)
             
             return ear > 0.25 and mar < 0.8  # Thresholds for open eyes and closed mouth
         
@@ -200,7 +234,7 @@ def main():
 
     try:
         if args.command == "add":
-            encodings, locations = FaceRecognizer.detect_faces(args.image)
+            encodings, locations = FaceRecognizer().detect_faces(args.image)
             if not encodings:
                 print("No valid faces found in image")
                 return
@@ -213,7 +247,7 @@ def main():
             print(f"Added {len(encodings)} faces to database")
 
         elif args.command == "search":
-            encodings, _ = FaceRecognizer.detect_faces(args.image)
+            encodings, _ = FaceRecognizer().detect_faces(args.image)
             if not encodings:
                 print("No faces found in query image")
                 return
