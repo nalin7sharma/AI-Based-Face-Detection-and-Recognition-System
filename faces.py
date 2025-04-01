@@ -1,442 +1,299 @@
 #!/usr/bin/env python3
 """
-Enterprise-Grade Face Recognition System
+Enterprise-Grade Face Recognition System 2.0
 
-Features:
-- Face detection and embedding generation
-- Similarity search and anti-spoofing
-- CLI interface for adding, searching, listing, and cleaning up faces
-- Data encryption using Fernet
-- Optional face clustering and GPU acceleration
+Key Upgrades:
+- Microservices architecture with REST API
+- PostgreSQL + pgvector for scalable similarity search
+- Advanced anti-spoofing with deep learning
+- JWT authentication
+- Async processing
+- Enhanced monitoring
+- Model versioning
 """
 
 import os
-import sqlite3
-import argparse
+import uuid
 import logging
-import json
-from datetime import datetime
-from typing import List, Tuple, Optional, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from contextlib import contextmanager
 
 import cv2
-import face_recognition
 import numpy as np
+import asyncpg
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, BaseSettings, validator
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from sklearn.preprocessing import normalize
-from PIL import Image, UnidentifiedImageError
-import tensorflow as tf
-from mtcnn import MTCNN
 from deepface import DeepFace
-from sklearn.cluster import DBSCAN
-import matplotlib.pyplot as plt
-import seaborn as sns
-import requests
-from cryptography.fernet import Fernet
-from logging.handlers import RotatingFileHandler
+from deepface.modules import verification
+from mtcnn import MTCNN
+from prometheus_fastapi_instrumentator import Instrumentator
+from loguru import logger
 
 # -------------------- Configuration --------------------
-class Config:
-    """Configuration settings for the face recognition system."""
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "face_db.sqlite")
-    IMAGE_SIZE = (250, 250)  # Balance between speed and accuracy
-    DETECTION_METHOD = os.getenv("DETECTION_METHOD", "mtcnn")  # Options: "haar", "dlib", "mtcnn"
-    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.6))
-    ENCODING_VERSION = os.getenv("ENCODING_VERSION", "Facenet")  # Options: "Facenet", "VGG-Face", "ArcFace"
-    ANTI_SPOOFING = os.getenv("ANTI_SPOOFING", "True") == "True"
-    LANDMARKS_MODEL = os.getenv("LANDMARKS_MODEL", "large")  # "small" for faster detection
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", 4))  # For parallel processing
-    LOG_FILE = os.getenv("LOG_FILE", "face_recognition.log")
-    ENABLE_CACHING = os.getenv("ENABLE_CACHING", "True") == "True"  # Cache embeddings for faster searches
-    DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", 30))  # Auto-delete old entries
-    ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
-    CLOUD_STORAGE_URL = os.getenv("CLOUD_STORAGE_URL")
-    ENABLE_CLUSTERING = os.getenv("ENABLE_CLUSTERING", "True") == "True"  # Enable face clustering
-    ENABLE_REALTIME = os.getenv("ENABLE_REALTIME", "True") == "True"  # Enable real-time processing
-    GPU_ACCELERATION = os.getenv("GPU_ACCELERATION", "True") == "True"  # Enable GPU acceleration
+class Settings(BaseSettings):
+    POSTGRES_URL: str = "postgresql://user:pass@localhost:5432/facedb"
+    SECRET_KEY: str = "your-secret-key-here"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    MODEL_VERSION: str = "Facenet512"
+    DETECTOR_BACKEND: str = "mtcnn"
+    SIMILARITY_THRESHOLD: float = 0.67
+    ANTI_SPOOFING: bool = True
+    ENABLE_METRICS: bool = True
+    
+    class Config:
+        env_file = ".env"
 
-# -------------------- Logging Setup --------------------
-def setup_logging() -> logging.Logger:
-    """Set up logging with both console and rotating file handlers."""
-    logger = logging.getLogger("FaceRecognition")
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    # Rotating file handler (max 5 MB per file, with 3 backups)
-    fh = RotatingFileHandler(Config.LOG_FILE, maxBytes=5*1024*1024, backupCount=3)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    return logger
-
-logger = setup_logging()
+settings = Settings()
 
 # -------------------- Security --------------------
-class SecurityManager:
-    """
-    Manages encryption and decryption for sensitive data.
-    Uses Fernet symmetric encryption.
-    """
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# -------------------- Database Models --------------------
+class FaceBase(BaseModel):
+    user_id: uuid.UUID
+    embedding: List[float]
+    model_version: str
+    metadata: Dict[str, Any] = {}
+
+class FaceCreate(FaceBase):
+    password: str  # For demo purposes only
+
+class Face(FaceBase):
+    id: uuid.UUID
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+# -------------------- Services --------------------
+class DatabaseService:
     def __init__(self):
-        self.cipher = Fernet(Config.ENCRYPTION_KEY.encode())
+        self.pool = None
 
-    def encrypt_data(self, data: bytes) -> bytes:
-        """Encrypts data using the configured key."""
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=settings.POSTGRES_URL,
+            min_size=5,
+            max_size=20
+        )
+        await self._init_db()
+
+    async def _init_db(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE EXTENSION IF NOT EXISTS vector;
+                CREATE TABLE IF NOT EXISTS faces (
+                    id UUID PRIMARY KEY,
+                    user_id UUID NOT NULL,
+                    embedding vector(512) NOT NULL,
+                    model_version TEXT NOT NULL,
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX ON faces USING ivfflat (embedding vector_l2_ops);
+            """)
+
+    @contextmanager
+    def metrics_connection(self):
+        conn = self.pool.acquire()
         try:
-            return self.cipher.encrypt(data)
-        except Exception as e:
-            logger.error(f"Encryption failed: {e}")
-            raise
+            yield conn
+        finally:
+            self.pool.release(conn)
 
-    def decrypt_data(self, encrypted_data: bytes) -> bytes:
-        """Decrypts data using the configured key."""
+class FaceService:
+    def __init__(self, db: DatabaseService):
+        self.db = db
+        self.detector = MTCNN()
+        self.anti_spoof_model = DeepFace.build_model("DeepFake")
+
+    async def detect_faces(self, image_path: str):
         try:
-            return self.cipher.decrypt(encrypted_data)
-        except Exception as e:
-            logger.error(f"Decryption failed: {e}")
-            raise
+            img = cv2.imread(image_path)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Face detection
+            faces = self.detector.detect_faces(img_rgb)
+            if not faces:
+                return []
 
-# -------------------- Database Management --------------------
-class FaceDatabase:
-    """
-    Handles database operations such as adding faces, searching,
-    listing, and cleaning up old entries.
-    """
-    def __init__(self, db_path: str = Config.DATABASE_PATH):
-        self.db_path = db_path
-        self.security = SecurityManager()
-        self.conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
-        self.conn.row_factory = sqlite3.Row
-        self._init_db()
+            # Anti-spoofing
+            valid_faces = []
+            for face in faces:
+                if settings.ANTI_SPOOFING:
+                    if not await self.check_liveness(img_rgb, face):
+                        continue
+                valid_faces.append(face)
 
-    def _init_db(self):
-        """Initializes the faces table and indexes."""
-        try:
-            with self.conn:
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS faces (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        embedding BLOB NOT NULL,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        metadata TEXT,
-                        UNIQUE(name, embedding)
-                    )
-                """)
-                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON faces(timestamp)")
-                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON faces(name)")
-            logger.info("Database initialized successfully.")
-        except sqlite3.Error as e:
-            logger.error(f"Database initialization error: {e}")
-            raise
-
-    def add_face(self, name: str, embedding: np.ndarray, metadata: Optional[Dict] = None):
-        """Adds a face record to the database."""
-        try:
-            encrypted_embedding = self.security.encrypt_data(embedding.tobytes())
-            with self.conn:
-                self.conn.execute(
-                    "INSERT INTO faces (name, embedding, metadata) VALUES (?, ?, ?)",
-                    (name, encrypted_embedding, json.dumps(metadata) if metadata else None),
+            # Embedding generation
+            embeddings = []
+            for face in valid_faces:
+                x, y, w, h = face['box']
+                face_img = img_rgb[y:y+h, x:x+w]
+                embedding = DeepFace.represent(
+                    face_img,
+                    model_name=settings.MODEL_VERSION,
+                    enforce_detection=False
                 )
-            logger.info(f"Added face: {name}")
-        except sqlite3.IntegrityError:
-            logger.warning(f"Duplicate face entry: {name}")
+                embeddings.append(normalize([embedding]).tolist()[0])
+
+            return embeddings
         except Exception as e:
-            logger.error(f"Failed to add face: {e}")
+            logger.error(f"Face detection error: {e}")
+            raise
 
-    def find_similar(self, embedding: np.ndarray, threshold: float) -> List[Dict]:
-        """
-        Searches for faces similar to the given embedding.
-        Returns records with similarity above the threshold.
-        """
+    async def check_liveness(self, image: np.ndarray, face: dict) -> bool:
         try:
-            cursor = self.conn.execute("SELECT id, name, embedding FROM faces")
-            target_embedding = normalize([embedding])
-            results = []
-
-            for row in cursor:
-                try:
-                    decrypted_embedding = self.security.decrypt_data(row["embedding"])
-                    db_embedding = np.frombuffer(decrypted_embedding, dtype=np.float64)
-                    db_embedding = normalize([db_embedding])
-                    similarity = float(np.dot(target_embedding, db_embedding.T)[0][0])
-                    if similarity >= threshold:
-                        results.append({
-                            "id": row["id"],
-                            "name": row["name"],
-                            "similarity": similarity
-                        })
-                except Exception as de:
-                    logger.error(f"Error processing embedding for id {row['id']}: {de}")
-
-            return sorted(results, key=lambda x: x["similarity"], reverse=True)
-        except sqlite3.Error as e:
-            logger.error(f"Database query error: {e}")
-            return []
-
-    def list_faces(self) -> List[Dict]:
-        """Returns a list of all faces in the database."""
-        try:
-            cursor = self.conn.execute("SELECT id, name, timestamp FROM faces")
-            return [dict(row) for row in cursor]
-        except sqlite3.Error as e:
-            logger.error(f"Failed to list faces: {e}")
-            return []
-
-    def cleanup_old_entries(self):
-        """Deletes entries older than the configured retention period."""
-        try:
-            with self.conn:
-                self.conn.execute("""
-                    DELETE FROM faces 
-                    WHERE timestamp < datetime('now', ?)
-                """, (f"-{Config.DATA_RETENTION_DAYS} days",))
-            logger.info("Cleaned up old database entries")
-        except sqlite3.Error as e:
-            logger.error(f"Cleanup error: {e}")
-
-    def close(self):
-        """Closes the database connection."""
-        try:
-            self.conn.close()
-            logger.info("Database connection closed.")
-        except sqlite3.Error as e:
-            logger.error(f"Error closing database: {e}")
-
-# -------------------- Face Recognition --------------------
-class FaceRecognizer:
-    """
-    Handles face detection, embedding generation, and liveness (anti-spoofing) checks.
-    """
-    def __init__(self):
-        # Choose the face detector based on the configuration
-        if Config.DETECTION_METHOD == "mtcnn":
-            self.detector = MTCNN()
-        else:
-            self.detector = None
-        self.security = SecurityManager()
-
-    def detect_faces(self, image_path: str) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
-        """
-        Detects faces in an image and returns their embeddings and bounding boxes.
-        Bounding boxes follow the (top, right, bottom, left) convention.
-        """
-        try:
-            image = face_recognition.load_image_file(image_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            if Config.DETECTION_METHOD == "mtcnn":
-                locations = self._detect_faces_mtcnn(image)
-            else:
-                locations = face_recognition.face_locations(image, model=Config.DETECTION_METHOD)
-
-            # Apply anti-spoofing check if enabled
-            if Config.ANTI_SPOOFING:
-                locations = [loc for loc in locations if self._check_liveness(image, loc)]
-
-            # Generate face embeddings
-            face_encodings = face_recognition.face_encodings(
-                image, locations, num_jitters=2, model=Config.ENCODING_VERSION
+            x, y, w, h = face['box']
+            face_roi = image[y:y+h, x:x+w]
+            prediction = DeepFace.analyze(
+                face_roi,
+                actions=["deepfake"],
+                detector_backend="skip",
+                models={"deepfake": self.anti_spoof_model},
+                enforce_detection=False
             )
-            processed_faces = [normalize([encoding])[0] for encoding in face_encodings]
-            return processed_faces, locations
-        except (FileNotFoundError, UnidentifiedImageError) as e:
-            logger.error(f"Image processing failed: {e}")
-            return [], []
-        except Exception as e:
-            logger.error(f"Unexpected error in detect_faces: {e}")
-            return [], []
-
-    def _detect_faces_mtcnn(self, image: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Detects faces using MTCNN and converts boxes to the expected format."""
-        try:
-            results = self.detector.detect_faces(image)
-            boxes = []
-            for result in results:
-                x, y, w, h = result.get("box", [0, 0, 0, 0])
-                # Convert [x, y, w, h] to (top, right, bottom, left)
-                boxes.append((y, x + w, y + h, x))
-            return boxes
-        except Exception as e:
-            logger.error(f"MTCNN detection error: {e}")
-            return []
-
-    def _check_liveness(self, image: np.ndarray, location: Tuple[int, int, int, int]) -> bool:
-        """
-        Checks face liveness using facial landmarks.
-        Returns True if the face passes the anti-spoofing check.
-        """
-        try:
-            landmarks_list = face_recognition.face_landmarks(image, [location], model=Config.LANDMARKS_MODEL)
-            if not landmarks_list:
-                return False
-            landmarks = landmarks_list[0]
-            left_eye = landmarks.get("left_eye", [])
-            right_eye = landmarks.get("right_eye", [])
-            mouth = landmarks.get("top_lip", []) + landmarks.get("bottom_lip", [])
-            if not left_eye or not right_eye or not mouth:
-                return False
-            ear = self._eye_aspect_ratio(left_eye + right_eye)
-            mar = self._mouth_aspect_ratio(mouth)
-            # Tunable thresholds: eyes must be open and mouth mostly closed
-            return ear > 0.25 and mar < 0.8
+            return prediction["deepfake"]["real"] > 0.8
         except Exception as e:
             logger.warning(f"Liveness check failed: {e}")
             return False
 
-    @staticmethod
-    def _eye_aspect_ratio(eye_points: List[Tuple[int, int]]) -> float:
-        """Calculates the eye aspect ratio (EAR)."""
-        if len(eye_points) < 6:
-            return 0.0
-        vertical1 = np.linalg.norm(np.array(eye_points[1]) - np.array(eye_points[5]))
-        vertical2 = np.linalg.norm(np.array(eye_points[2]) - np.array(eye_points[4]))
-        horizontal = np.linalg.norm(np.array(eye_points[0]) - np.array(eye_points[3]))
-        return (vertical1 + vertical2) / (2.0 * horizontal) if horizontal != 0 else 0.0
+class AuthService:
+    def __init__(self, db: DatabaseService):
+        self.db = db
 
-    @staticmethod
-    def _mouth_aspect_ratio(mouth_points: List[Tuple[int, int]]) -> float:
-        """Calculates the mouth aspect ratio (MAR)."""
-        if len(mouth_points) < 11:
-            return 0.0
-        vertical = np.linalg.norm(np.array(mouth_points[2]) - np.array(mouth_points[10]))
-        horizontal = np.linalg.norm(np.array(mouth_points[0]) - np.array(mouth_points[6]))
-        return vertical / horizontal if horizontal != 0 else 0.0
+    async def authenticate_user(self, username: str, password: str):
+        async with self.db.pool.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT * FROM users WHERE username = $1", username
+            )
+            if not user:
+                return False
+            if not pwd_context.verify(password, user["password"]):
+                return False
+            return user
 
-# -------------------- Advanced Clustering (Optional) --------------------
-def perform_face_clustering(embeddings: List[np.ndarray], eps: float = 0.5, min_samples: int = 2):
-    """
-    Performs clustering on face embeddings using DBSCAN and plots the clusters.
-    """
-    if not embeddings:
-        logger.info("No embeddings provided for clustering.")
-        return
+    def create_access_token(self, data: dict):
+        expires = datetime.utcnow() + timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        data.update({"exp": expires})
+        return jwt.encode(data, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
-    embeddings_matrix = np.vstack(embeddings)
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean').fit(embeddings_matrix)
-    labels = clustering.labels_
+# -------------------- API Endpoints --------------------
+app = FastAPI(title="Face Recognition API")
 
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=embeddings_matrix[:, 0], y=embeddings_matrix[:, 1],
-                    hue=labels, palette="viridis", legend="full")
-    plt.title("Face Embedding Clusters")
-    plt.xlabel("Embedding Dimension 1")
-    plt.ylabel("Embedding Dimension 2")
-    plt.show()
-    logger.info(f"Clustering completed with {len(set(labels)) - (1 if -1 in labels else 0)} clusters.")
+@app.on_event("startup")
+async def startup():
+    db = DatabaseService()
+    await db.connect()
+    app.state.db = db
+    app.state.face_service = FaceService(db)
+    app.state.auth_service = AuthService(db)
+    
+    if settings.ENABLE_METRICS:
+        Instrumentator().instrument(app).expose(app)
 
-# -------------------- GPU Acceleration Setup --------------------
-def setup_gpu():
-    """Configures TensorFlow for GPU usage if enabled."""
-    if Config.GPU_ACCELERATION:
-        try:
-            physical_devices = tf.config.list_physical_devices('GPU')
-            if physical_devices:
-                for device in physical_devices:
-                    tf.config.experimental.set_memory_growth(device, True)
-                logger.info("GPU acceleration enabled.")
-            else:
-                logger.info("No GPU devices found, running on CPU.")
-        except Exception as e:
-            logger.error(f"Error setting up GPU acceleration: {e}")
-
-# -------------------- CLI Interface --------------------
-def main():
-    """Main CLI handler for various face recognition tasks."""
-    setup_gpu()  # Configure GPU if available
-    parser = argparse.ArgumentParser(
-        description="Advanced Enterprise-Grade Face Recognition System"
+# Dependency
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    subparsers = parser.add_subparsers(dest="command", help="Sub-command help")
-
-    # Add face command
-    add_parser = subparsers.add_parser("add", help="Add faces to the database")
-    add_parser.add_argument("image", help="Path to the image file")
-    add_parser.add_argument("--name", required=True, help="Name for the face(s)")
-
-    # Search command
-    search_parser = subparsers.add_parser("search", help="Search for similar faces")
-    search_parser.add_argument("image", help="Path to the query image")
-
-    # List command
-    subparsers.add_parser("list", help="List all faces in the database")
-
-    # Cleanup command
-    subparsers.add_parser("cleanup", help="Clean up old database entries")
-
-    # Clustering command (if enabled)
-    if Config.ENABLE_CLUSTERING:
-        cluster_parser = subparsers.add_parser("cluster", help="Perform face clustering")
-        cluster_parser.add_argument("image_folder", help="Path to folder containing face images")
-
-    args = parser.parse_args()
-    db = FaceDatabase()
-
     try:
-        if args.command == "add":
-            recognizer = FaceRecognizer()
-            embeddings, locations = recognizer.detect_faces(args.image)
-            if not embeddings:
-                print("No valid faces found in image")
-                return
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    async with app.state.db.pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT * FROM users WHERE username = $1", username
+        )
+        if user is None:
+            raise credentials_exception
+        return user
 
-            for idx, encoding in enumerate(embeddings):
-                metadata = {"original_image": args.image, "face_location": locations[idx]}
-                db.add_face(args.name, encoding, metadata)
-            print(f"Added {len(embeddings)} face(s) to the database.")
+@app.post("/faces/", response_model=Face)
+async def create_face(face: FaceCreate, current_user: dict = Depends(get_current_user)):
+    face_service = app.state.face_service
+    embeddings = await face_service.detect_faces(face.image_path)
+    
+    if not embeddings:
+        raise HTTPException(status_code=400, detail="No valid faces detected")
+    
+    async with app.state.db.pool.acquire() as conn:
+        face_id = uuid.uuid4()
+        await conn.execute("""
+            INSERT INTO faces (id, user_id, embedding, model_version, metadata)
+            VALUES ($1, $2, $3, $4, $5)
+        """, face_id, face.user_id, embeddings[0], settings.MODEL_VERSION, face.metadata)
+    
+    return {**face.dict(), "id": face_id, "created_at": datetime.now()}
 
-        elif args.command == "search":
-            recognizer = FaceRecognizer()
-            embeddings, _ = recognizer.detect_faces(args.image)
-            if not embeddings:
-                print("No faces found in query image")
-                return
+@app.get("/faces/search")
+async def search_faces(image_path: str, threshold: float = None):
+    face_service = app.state.face_service
+    threshold = threshold or settings.SIMILARITY_THRESHOLD
+    
+    embeddings = await face_service.detect_faces(image_path)
+    if not embeddings:
+        return {"matches": []}
+    
+    async with app.state.db.pool.acquire() as conn:
+        results = await conn.fetch("""
+            SELECT id, user_id, metadata, embedding <-> $1 as distance
+            FROM faces
+            WHERE embedding <-> $1 < $2
+            ORDER BY distance
+            LIMIT 10
+        """, embeddings[0], threshold)
+    
+    return {
+        "matches": [
+            {
+                "id": str(record["id"]),
+                "user_id": str(record["user_id"]),
+                "distance": float(record["distance"]),
+                "metadata": record["metadata"]
+            }
+            for record in results
+        ]
+    }
 
-            results = db.find_similar(embeddings[0], Config.SIMILARITY_THRESHOLD)
-            if results:
-                print("Matching faces:")
-                for match in results:
-                    print(f"- {match['name']} (similarity: {match['similarity']:.2%})")
-            else:
-                print("No matches found.")
+@app.post("/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends())):
+    user = await app.state.auth_service.authenticate_user(
+        form_data.username, form_data.password
+    )
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = app.state.auth_service.create_access_token(
+        data={"sub": user["username"]}
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
-        elif args.command == "list":
-            faces = db.list_faces()
-            if faces:
-                for face in faces:
-                    print(f"ID: {face['id']} | Name: {face['name']} | Added: {face['timestamp']}")
-            else:
-                print("No faces in the database.")
+# -------------------- Monitoring --------------------
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
 
-        elif args.command == "cleanup":
-            db.cleanup_old_entries()
-            print("Database cleanup completed.")
-
-        elif args.command == "cluster" and Config.ENABLE_CLUSTERING:
-            image_folder = args.image_folder
-            if not os.path.isdir(image_folder):
-                print(f"Invalid folder: {image_folder}")
-                return
-
-            embeddings = []
-            recognizer = FaceRecognizer()
-            images = [os.path.join(image_folder, f) for f in os.listdir(image_folder)
-                      if os.path.isfile(os.path.join(image_folder, f))]
-            with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-                future_to_image = {executor.submit(recognizer.detect_faces, img): img for img in images}
-                for future in as_completed(future_to_image):
-                    try:
-                        emb, _ = future.result()
-                        if emb:
-                            embeddings.extend(emb)
-                    except Exception as e:
-                        logger.error(f"Error processing image {future_to_image[future]}: {e}")
-            perform_face_clustering(embeddings)
-        else:
-            parser.print_help()
-    finally:
-        db.close()
-
+# -------------------- Main --------------------
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
