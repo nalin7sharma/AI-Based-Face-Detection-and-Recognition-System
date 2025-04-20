@@ -1,17 +1,59 @@
-fastapi>=0.68.0
-uvicorn[standard]>=0.15.0
-asyncpg>=0.24.0
-python-jose[cryptography]>=3.3.0
-passlib>=1.7.4
-bcrypt>=3.2.0
-mtcnn>=0.1.0
-deepface>=0.0.79
-opencv-python-headless>=4.5.3
-numpy>=1.21.0
-scikit-learn>=1.0.0
-prometheus-fastapi-instrumentator>=5.9.1
-loguru>=0.5.3
-tensorflow>=2.6.0
-requests>=2.26.0
-python-multipart>=0.0.5
-python-dotenv>=0.19.0
+# Core Dependencies
+streamlit>=1.28.0
+numpy>=1.24.0
+opencv-python-headless>=4.7.0
+Pillow>=10.0.0
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+web3>=6.0.0
+pycuda>=2022.1
+nvidia-tensorrt>=8.6.1
+cryptography>=41.0.0
+python-dotenv>=1.0.0
+streamlit-webrtc>=0.47.0
+python-socketio>=5.7.0
+hologram-py>=0.4.2  # Placeholder for quantum projection
+neptune-client>=1.2.0  # For AI model tracking
+boto3>=1.28.0  # AWS cloud integration
+google-cloud-storage>=2.10.0  # GCP integration
+azure-storage-blob>=12.16.0  # Azure integration
+qiskit-ibm-runtime>=0.12.0  # Quantum computing
+cirq-superstaq>=0.4.0  # Alternative quantum backend
+ar-core>=3.4.1  # Augmented Reality SDK
+tensorrt>=8.6.1  # NVIDIA TensorRT
+pycryptodome>=3.18.0  # Advanced cryptography
+psutil>=5.9.0  # System monitoring
+
+# AI/ML Specific
+transformers>=4.34.0
+diffusers>=0.21.0
+accelerate>=0.24.0
+bitsandbytes>=0.41.0
+scikit-image>=0.21.0
+onnxruntime-gpu>=1.16.0
+
+# Blockchain
+eth-account>=0.9.0
+ipfshttpclient>=0.8.0
+solana>=0.28.0
+
+# Optional GPU Acceleration
+nvidia-cudnn-cu11>=8.9.2  # CUDA Deep Neural Network
+nvidia-cublas-cu11>=11.11.3  # CUDA Basic Linear Algebra
+nvidia-cuda-nvrtc-cu11>=11.7.99  # CUDA Runtime Compiler
+
+# Quantization
+efficientnet-pytorch>=0.7.1
+tensorflow>=2.13.0  # For some quantization tools
+
+# Security
+python-keycloak>=2.13.0  # RBAC integration
+vault>=1.0.0  # Secret management
+
+# Note: Some components require proprietary SDKs:
+# - NVIDIA GPU drivers (515+)
+# - CUDA Toolkit 11.8+
+# - cuDNN 8.9+
+# - TensorRT 8.6+
+# - Quantum computing vendor SDKs
