@@ -1,50 +1,36 @@
-# Core Dependencies
-streamlit==1.32.0
-numpy==1.26.0
-torch==2.3.0
-opencv-python-headless==4.9.0
-Pillow==10.3.0
-cryptography==42.0.5
-web3==6.15.1
-pycuda==2023.1.1
-zstandard==0.22.0
+# Core dependencies
+streamlit>=1.22.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python-headless>=4.7.0
+Pillow>=9.5.0
+cryptography>=40.0.0
+web3>=6.0.0
+pycryptodome>=3.17.0
+zstandard>=0.21.0
+streamlit-webrtc>=0.44.0
+python-dotenv>=1.0.0
 
-# AI/ML Components
-transformers==4.40.0
-diffusers==0.28.0
-tensorrt==10.0.1  # Requires NVIDIA CUDA toolkit
-torchvision==0.18.0
+# AI/ML specific
+transformers>=4.30.0
+diffusers>=0.18.0
+clip-anytorch>=2.5.0
 
-# Multimedia Processing
-ffmpeg-python==0.2.0
-imageio-ffmpeg==0.4.9
+# Blockchain utilities
+ipfshttpclient>=0.8.0
 
-# Distributed Computing
-dask[complete]==2024.1.0
-ray[default]==2.11.0
+# 3D/holographics
+pyopengl>=3.1.6
+pywavefront>=1.3.3
 
-# Enterprise Security
-rbac==0.6.0  # Hypothetical RBAC framework
-fernet==1.1.0
+# Augmented Reality
+open3d>=0.17.0
 
-# Blockchain Integration
-web3==6.15.1
-ipfshttpclient==0.8.0
+# Distributed computing
+dask[complete]>=2023.6.0
+distributed>=2023.6.0
+boto3>=1.26.0
 
-# AR/VR Components
-open3d==0.18.0
-pyglet==2.0.15
-
-# Specialized Modules (Hypothetical - would require custom installation)
-# hologram @ https://github.com/quantum-holo/hologram-sdk
-# neptune_ai @ git+https://gitlab.com/neptune-ai/core
-# distributed_cloud @ git+https://github.com/distributed-compute/cloud-cluster
-# ar_core @ git+https://github.com/ar-foundation/arcore-python
-# streamlit_webrtc @ git+https://github.com/whitphx/streamlit-webrtc
-
-# Quantum Computing Simulator
-qiskit==1.0.0
-
-# MLOps Tools
-mlflow==2.13.0
-wandb==0.17.0
+# Security frameworks
+rbac>=0.2.0
